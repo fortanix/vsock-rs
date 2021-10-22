@@ -20,7 +20,7 @@
 //! Virtio socket support for Rust.
 
 use core::mem;
-#[cfg(feature="std")]
+use core::fmt::{Display, Error as FmtError, Formatter};
 use core::convert::TryFrom;
 use core::marker::PhantomData;
 use core::time::Duration;
@@ -35,6 +35,8 @@ use nix::ioctl_read_bad;
 #[cfg(feature="std")]
 use nix::sys::socket::{SockAddr as NixSockAddr, VsockAddr as NixVsockAddr};
 #[cfg(feature="std")]
+use std::error::Error as StdError;
+#[cfg(feature="std")]
 use std::fs::File;
 #[cfg(feature="std")]
 use std::io::{self, ErrorKind, Read, Write};
@@ -43,7 +45,9 @@ pub use std::net::Shutdown;
 #[cfg(feature="std")]
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 
+#[cfg(feature="random_port")]
 const MAX_PRIVILEGED_PORT: u32 = 1023;
+#[cfg(feature="random_port")]
 const BIND_RETRIES: u32 = 10;
 
 #[cfg(not(feature="std"))]
@@ -62,27 +66,30 @@ pub enum Error {
     ReservedPort,
 }
 
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
+        match self {
+            Error::EntropyError        => write!(f, "failed to retrieve enough entropy"),
+            Error::SystemError(errno)  => write!(f, "system error {}", errno),
+            Error::WrongAddressType    => write!(f, "wrong address type provided"),
+            Error::ZeroDurationTimeout => write!(f, "cannot set a zero duration timeout"),
+            Error::ReservedPort        => write!(f, "reserved port"),
+        }
+    }
+}
+
+#[cfg(feature="std")]
+impl StdError for Error {}
+
 #[cfg(feature="std")]
 impl From<Error> for io::Error {
     fn from(err: Error) -> io::Error {
         match err {
-            Error::EntropyError => io::Error::new(
-                ErrorKind::Other,
-                "Failed to retrieve entropy",
-            ),
-            Error::ReservedPort => io::Error::new(
-                ErrorKind::InvalidInput,
-                "Reserved port"
-            ),
-            Error::SystemError(errno) => io::Error::from_raw_os_error(errno),
-            Error::WrongAddressType => io::Error::new(
-                ErrorKind::InvalidInput,
-                "Wrong address type provided"
-            ),
-            Error::ZeroDurationTimeout => io::Error::new(
-                ErrorKind::InvalidInput,
-                "cannot set a zero duration timeout"
-            ),
+            Error::EntropyError        => io::Error::new(ErrorKind::Other, err),
+            Error::ReservedPort        => io::Error::new(ErrorKind::InvalidInput, err),
+            Error::SystemError(errno)  => io::Error::from_raw_os_error(errno),
+            Error::WrongAddressType    => io::Error::new(ErrorKind::InvalidInput, err),
+            Error::ZeroDurationTimeout => io::Error::new(ErrorKind::InvalidInput, err),
         }
     }
 }
@@ -114,6 +121,18 @@ impl SockAddr {
 impl From<SockAddr> for NixSockAddr {
     fn from(addr: SockAddr) -> NixSockAddr {
         NixSockAddr::Vsock(NixVsockAddr(addr.0))
+    }
+}
+
+impl TryFrom<libc::sockaddr_vm> for SockAddr {
+    type Error = ();
+
+    fn try_from(addr: libc::sockaddr_vm) -> Result<SockAddr, ()> {
+        if addr.svm_family == libc::AF_VSOCK as _ {
+            Ok(SockAddr(addr))
+        } else {
+            Err(())
+        }
     }
 }
 
@@ -227,23 +246,11 @@ impl<P: Platform> VsockListener<P> {
         Ok(Self { socket, phantom: PhantomData::<P>::default()})
     }
 
-    #[cfg(feature="random_port")]
-    fn gen_rand_port() -> Result<u32, Error> {
-        let mut buf = [0u8; 4];
-        getrandom::getrandom(&mut buf).map_err(|_e| Error::EntropyError)?;
-        let port = u32::from_le_bytes(buf);
-        if port <= MAX_PRIVILEGED_PORT {
-            Self::gen_rand_port()
-        } else {
-            Ok(port)
-        }
-    }
-
     /// Create a new VsockListener with specified cid and random port.
     #[cfg(feature="random_port")]
     pub fn bind_with_cid(cid: u32) -> Result<VsockListener<P>, Error> {
         fn bind_with_cid_ex<P: Platform>(cid: u32, retries: u32) -> Result<VsockListener<P>, Error> {
-            let listener = VsockListener::<P>::gen_rand_port().
+            let listener = Vsock::gen_rand_port().
                                 and_then(|port| VsockListener::<P>::bind_with_cid_port(cid, port));
             match listener {
                 Ok(listener)           => Ok(listener),
@@ -256,26 +263,7 @@ impl<P: Platform> VsockListener<P> {
 
     /// The local socket address of the listener.
     pub fn local_addr(&self) -> Result<SockAddr, Error> {
-        let mut vsock_addr = sockaddr_vm {
-            svm_family: AF_VSOCK as sa_family_t,
-            svm_reserved1: 0,
-            svm_port: 0,
-            svm_cid: 0,
-            svm_zero: [0u8; 4],
-        };
-        let mut vsock_addr_len = mem::size_of::<sockaddr_vm>() as socklen_t;
-        if unsafe {
-            getsockname(
-                self.socket,
-                &mut vsock_addr as *mut _ as *mut sockaddr,
-                &mut vsock_addr_len,
-            )
-        } < 0
-        {
-            Err(P::last_os_error())
-        } else {
-            Ok(SockAddr(vsock_addr))
-        }
+        socket_addr::<P>(self.socket)
     }
 
     /// Create a new independently owned handle to the underlying socket.
@@ -390,6 +378,114 @@ impl<P: Platform> Drop for VsockListener<P> {
     }
 }
 
+fn socket_addr<P: Platform>(socket: RawFd) -> Result <SockAddr, Error> {
+    let mut vsock_addr = sockaddr_vm {
+        svm_family: AF_VSOCK as sa_family_t,
+        svm_reserved1: 0,
+        svm_port: 0,
+        svm_cid: 0,
+        svm_zero: [0u8; 4],
+    };
+    let mut vsock_addr_len = mem::size_of::<sockaddr_vm>() as socklen_t;
+    if unsafe {
+        getsockname(
+            socket,
+            &mut vsock_addr as *mut _ as *mut sockaddr,
+            &mut vsock_addr_len,
+        )
+    } < 0
+    {
+        Err(P::last_os_error())
+    } else {
+        Ok(SockAddr(vsock_addr))
+    }
+}
+
+pub struct Vsock {
+    socket: RawFd,
+}
+
+impl Vsock {
+    #[cfg(feature="random_port")]
+    fn gen_rand_port() -> Result<u32, Error> {
+        let mut buf = [0u8; 4];
+        getrandom::getrandom(&mut buf).map_err(|_e| Error::EntropyError)?;
+        let port = u32::from_le_bytes(buf);
+        if port <= MAX_PRIVILEGED_PORT {
+            Self::gen_rand_port()
+        } else {
+            Ok(port)
+        }
+    }
+
+    pub fn new<P: Platform>() -> Result<Self, Error> {
+        let socket = new_socket();
+        let mut socket = if 0 <= socket {
+            Ok(Vsock{ socket })
+        } else {
+            Err(<P as Platform>::last_os_error())
+        }?;
+        socket.bind::<P>(VMADDR_CID_ANY, 0)?;
+        Ok(socket)
+    }
+
+    fn bind<P: Platform>(&mut self, cid: u32, port: u32) -> Result<(), Error> {
+        fn do_bind<P: Platform>(vsock: &mut Vsock, cid: u32, port: u32) -> Result<(), Error> {
+            #[cfg(feature="random_port")]
+            let port = if port == 0 {
+                Vsock::gen_rand_port()?
+            } else {
+                port
+            };
+
+            let mut addr = sockaddr_vm {
+                svm_family: AF_VSOCK as sa_family_t,
+                svm_reserved1: 0,
+                svm_port: port,
+                svm_cid: cid,
+                svm_zero: [0u8; 4],
+            };
+            let res = unsafe {
+                bind(
+                    vsock.socket,
+                    &mut addr as *mut _ as *mut sockaddr,
+                    mem::size_of::<sockaddr_vm>() as socklen_t,
+                )
+            };
+            if res < 0 {
+                Err(P::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+        fn bind_ex<P: Platform>(vsock: &mut Vsock, cid: u32, port: u32, retries: u32) -> Result<(), Error> {
+            match do_bind::<P>(vsock, cid, port) {
+                Ok(())                 => Ok(()),
+                Err(e) if retries == 0 => Err(e),
+                Err(_e)                => bind_ex::<P>(vsock, cid, port, retries - 1)
+            }
+        }
+        #[cfg(not(feature="random_port"))]
+        if port == 0 {
+            return Err(Error::ReservedPort);
+        }
+        bind_ex::<P>(self, cid, port, BIND_RETRIES)
+    }
+
+    pub fn addr<P: Platform>(&self) -> Result<SockAddr, Error> {
+        socket_addr::<P>(self.socket)
+    }
+
+    pub fn connect_with_cid_port<P: Platform>(self, cid: u32, port: u32) -> Result<VsockStream<P>, Error> {
+        let addr = new_socket_addr(cid, port);
+        Vsock::connect_with_socket_addr(self, &addr)
+    }
+
+    pub fn connect_with_socket_addr<P: Platform>(self, vsock_addr: &libc::sockaddr_vm) -> Result<VsockStream<P>, Error> {
+        VsockStream::<P>::connect_vsock_to_socket_addr(self, vsock_addr)
+    }
+}
+
 /// A virtio stream between a local and a remote socket.
 #[derive(Debug, Clone)]
 #[cfg(feature="std")]
@@ -431,21 +527,23 @@ impl<P: Platform> VsockStream<P> {
 
     /// Open a connection to a remote host.
     pub fn connect_with_socket_addr(vsock_addr: &libc::sockaddr_vm) -> Result<Self, Error> {
-        let sock = new_socket();
-        if sock < 0 {
-            return Err(<P as Platform>::last_os_error());
-        }
+        let vsock = Vsock::new::<P>()?;
+        Self::connect_vsock_to_socket_addr(vsock, vsock_addr)
+    }
+
+    fn connect_vsock_to_socket_addr(local: Vsock, remote: &libc::sockaddr_vm) -> Result<Self, Error> {
+        let Vsock { socket: local } = local;
         if unsafe {
             connect(
-                sock,
-                vsock_addr as *const _ as *const sockaddr,
+                local,
+                remote as *const _ as *const sockaddr,
                 mem::size_of::<sockaddr_vm>() as socklen_t,
             )
         } < 0
         {
             Err(<P as Platform>::last_os_error())
         } else {
-            Ok(unsafe { VsockStream::from_raw_fd(sock) })
+            Ok(unsafe { VsockStream::from_raw_fd(local) })
         }
     }
 
