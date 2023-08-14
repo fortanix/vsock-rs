@@ -794,6 +794,26 @@ impl<P: Platform> VsockStream<P> {
         }
     }
 
+    #[cfg(not(feature="std"))]
+    pub fn write_all(&self, buf: &[u8]) -> Result<usize, Error> {
+        if buf.len() == 0 {
+            return Ok(0);
+        }
+
+        let n = self.write(buf)?;
+        Ok(n + self.write_all(&buf[n..])?)
+    }
+
+    #[cfg(not(feature="std"))]
+    pub fn read_all(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        if buf.len() == 0 {
+            return Ok(0);
+        }
+
+        let n = self.read(buf)?;
+        Ok(n + self.read_all(&mut buf[n..])?)
+    }
+
     pub fn flush() -> Result<(), Error> {
         Ok(())
     }
