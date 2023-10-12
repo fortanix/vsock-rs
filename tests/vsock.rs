@@ -114,8 +114,8 @@ fn handle_connection(stream: &mut VsockStream) {
 }
 
 #[cfg(feature="std")]
-fn start_server(port: u32) -> (JoinHandle<()>, u32) {
-    let listener = VsockListener::bind_with_cid_port(VMADDR_CID_LOCAL, port).unwrap();
+fn start_server(cid: u32, port: u32) -> (JoinHandle<()>, u32) {
+    let listener = VsockListener::bind_with_cid_port(cid, port).unwrap();
     assert_eq!(SockAddr::from_raw_fd::<Std>(listener.as_raw_fd()).unwrap(), listener.local_addr().unwrap());
     assert_eq!(SockAddr::peer_from_raw_fd::<Std>(listener.as_raw_fd()).unwrap_err(), Error::SystemError(107));
     let port = if let NixSockAddr::Vsock(vsock) = listener.local_addr().unwrap().into() {
@@ -140,8 +140,8 @@ fn start_server(port: u32) -> (JoinHandle<()>, u32) {
 }
 
 #[cfg(feature="std")]
-fn test_connection(port: u32) {
-    let mut client = VsockStream::<Std>::connect_with_cid_port(VMADDR_CID_LOCAL, port).unwrap();
+fn connect(cid: u32, port: u32) -> Result<(Request, Response), Error> {
+    let mut client = VsockStream::<Std>::connect_with_cid_port(cid, port)?;
     let req = Request {
         message: "Hello world!".to_string(),
     };
@@ -149,6 +149,12 @@ fn test_connection(port: u32) {
     let mut buff = [0u8; 100];
     let n = client.read(&mut buff).unwrap();
     let resp: Response = serde_cbor::from_slice(&buff[0..n]).unwrap();
+    Ok((req, resp))
+}
+
+#[cfg(feature="std")]
+fn test_connection(cid: u32, port: u32) {
+    let (req, resp) = connect(cid, port).unwrap();
     println!("send: {:?}", req);
     println!("received: {:?}", resp);
     assert_eq!(resp, Response { message: req.message.to_uppercase() });
@@ -157,23 +163,27 @@ fn test_connection(port: u32) {
 #[test]
 #[cfg(feature="std")]
 fn test_loopback() {
-    let (_server_thread, port) = start_server(3000);
+    let (_server_thread, port) = start_server(vsock::VMADDR_CID_ANY, 3001);
     // Wait until server started
     std::thread::sleep(Duration::from_millis(500));
-    test_connection(port);
-    test_connection(port);
-    test_connection(port);
+    test_connection(VMADDR_CID_LOCAL, port);
+    assert!(connect(vsock::VMADDR_CID_HOST, port).is_err());
+    connect(vsock::VMADDR_CID_HOST, port).or_else(|_e| connect(vsock::VMADDR_CID_LOCAL, port)).unwrap();
+    connect(vsock::VMADDR_CID_HOST, port).or_else(|_e| connect(vsock::VMADDR_CID_LOCAL, port)).unwrap();
+    connect(vsock::VMADDR_CID_HOST, port).or_else(|_e| connect(vsock::VMADDR_CID_LOCAL, port)).unwrap();
+    test_connection(VMADDR_CID_LOCAL, port);
+    test_connection(VMADDR_CID_LOCAL, port);
 }
 
 #[test]
 #[cfg(feature="std")]
 fn test_loopback_rand_port() {
-    let (_server_thread, port0) = start_server(0);
-    let (_server_thread, port1) = start_server(0);
-    let (_server_thread, port2) = start_server(0);
+    let (_server_thread, port0) = start_server(VMADDR_CID_LOCAL, 0);
+    let (_server_thread, port1) = start_server(VMADDR_CID_LOCAL, 0);
+    let (_server_thread, port2) = start_server(VMADDR_CID_LOCAL, 0);
     // Wait until server started
     std::thread::sleep(Duration::from_millis(500));
-    test_connection(port0);
-    test_connection(port1);
-    test_connection(port2);
+    test_connection(VMADDR_CID_LOCAL, port0);
+    test_connection(VMADDR_CID_LOCAL, port1);
+    test_connection(VMADDR_CID_LOCAL, port2);
 }
