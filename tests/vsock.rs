@@ -19,9 +19,9 @@ use {
     nix::sys::socket::{SockAddr as NixSockAddr},
     std::time::Duration,
     std::thread::{self, JoinHandle},
-    std::io::Write,
+    std::io::{Write, Error},
     std::os::unix::io::AsRawFd,
-    vsock::{Error, Std, SockAddr, VsockListener, VsockStream, VMADDR_CID_LOCAL},
+    vsock::{Std, SockAddr, VsockListener, VsockStream, VMADDR_CID_LOCAL},
 };
 
 #[cfg(feature="test_vm")]
@@ -117,7 +117,7 @@ fn handle_connection(stream: &mut VsockStream) {
 fn start_server(port: u32) -> (JoinHandle<()>, u32) {
     let listener = VsockListener::bind_with_cid_port(VMADDR_CID_LOCAL, port).unwrap();
     assert_eq!(SockAddr::from_raw_fd::<Std>(listener.as_raw_fd()).unwrap(), listener.local_addr().unwrap());
-    assert_eq!(SockAddr::peer_from_raw_fd::<Std>(listener.as_raw_fd()).unwrap_err(), Error::SystemError(107));
+    assert_eq!(SockAddr::peer_from_raw_fd::<Std>(listener.as_raw_fd()).unwrap_err().raw_os_error(), Error::from_raw_os_error(107).raw_os_error());
     let port = if let NixSockAddr::Vsock(vsock) = listener.local_addr().unwrap().into() {
         vsock.port()
     } else {

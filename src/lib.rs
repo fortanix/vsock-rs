@@ -20,7 +20,6 @@
 #![deny(warnings)]
 
 use core::mem;
-use core::fmt::{Display, Error as FmtError, Formatter};
 use core::convert::TryFrom;
 use core::marker::PhantomData;
 use core::time::Duration;
@@ -35,11 +34,9 @@ use nix::ioctl_read_bad;
 #[cfg(feature="std")]
 use nix::sys::socket::{SockAddr as NixSockAddr, VsockAddr as NixVsockAddr};
 #[cfg(feature="std")]
-use std::error::Error as StdError;
-#[cfg(feature="std")]
 use std::fs::File;
 #[cfg(feature="std")]
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Write, Error};
 #[cfg(feature="std")]
 pub use std::net::Shutdown;
 #[cfg(feature="std")]
@@ -52,6 +49,8 @@ const BIND_RETRIES: u32 = 10;
 #[cfg(not(feature="random_port"))]
 const BIND_RETRIES: u32 = 0;
 
+pub use nix::sys::socket::VsockAddr;
+
 #[cfg(not(feature="std"))]
 pub enum Shutdown {
     Read,
@@ -59,41 +58,22 @@ pub enum Shutdown {
     Both,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Error {
-    EntropyError,
-    SystemError(i32),
-    WrongAddressType,
-    ZeroDurationTimeout,
-    ReservedPort,
+fn entropy_error() -> Error {
+    Error::new(ErrorKind::Other, "failed to retrieve enough entropy")
 }
 
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
-        match self {
-            Error::EntropyError        => write!(f, "failed to retrieve enough entropy"),
-            Error::SystemError(errno)  => write!(f, "system error {}", errno),
-            Error::WrongAddressType    => write!(f, "wrong address type provided"),
-            Error::ZeroDurationTimeout => write!(f, "cannot set a zero duration timeout"),
-            Error::ReservedPort        => write!(f, "reserved port"),
-        }
-    }
+#[cfg(not(feature="random_port"))]
+fn reserved_port() -> Error {
+    Error::new(ErrorKind::InvalidInput, "reserved port")
 }
-
-#[cfg(feature="std")]
-impl StdError for Error {}
-
-#[cfg(feature="std")]
-impl From<Error> for io::Error {
-    fn from(err: Error) -> io::Error {
-        match err {
-            Error::EntropyError        => io::Error::new(ErrorKind::Other, err),
-            Error::ReservedPort        => io::Error::new(ErrorKind::InvalidInput, err),
-            Error::SystemError(errno)  => io::Error::from_raw_os_error(errno),
-            Error::WrongAddressType    => io::Error::new(ErrorKind::InvalidInput, err),
-            Error::ZeroDurationTimeout => io::Error::new(ErrorKind::InvalidInput, err),
-        }
-    }
+fn system_error(errno: i32) -> Error {
+    Error::from_raw_os_error(errno)
+}
+fn wrong_address_type() -> Error {
+    Error::new(ErrorKind::InvalidInput, "wrong address type provided")
+}
+fn zero_duration_timeout() -> Error {
+    Error::new(ErrorKind::InvalidInput, "cannot set a zero duration timeout")
 }
 
 pub trait Platform {
@@ -107,8 +87,7 @@ pub struct Std;
 #[cfg(feature="std")]
 impl Platform for Std {
     fn last_os_error() -> Error {
-        let errno = io::Error::last_os_error().raw_os_error().expect("Error from OS");
-        Error::SystemError(errno)
+        Error::last_os_error()
     }
 }
 
@@ -226,7 +205,7 @@ impl VsockListener<Std> {
         if let NixSockAddr::Vsock(addr) = addr {
             Self::bind_with_cid_port(addr.cid(), addr.port())
         } else {
-            Err(Error::WrongAddressType)
+            Err(wrong_address_type())
         }
     }
 }
@@ -238,7 +217,7 @@ impl<P: Platform> VsockListener<P> {
             #[cfg(feature="random_port")]
             return Self::bind_with_cid(cid);
             #[cfg(not(feature="random_port"))]
-            return Err(Error::ReservedPort);
+            return Err(reserved_port());
         }
         let socket = new_socket();
         if socket < 0 {
@@ -324,7 +303,7 @@ impl<P: Platform> VsockListener<P> {
     }
 
     /// An iterator over the connections being received on this listener.
-    pub fn incoming(&self) -> Incoming<P> {
+    pub fn incoming(&self) -> Incoming<'_, P> {
         Incoming::<P> { listener: self }
     }
 
@@ -347,7 +326,7 @@ impl<P: Platform> VsockListener<P> {
             Ok(if error == 0 {
                 None
             } else {
-                Some(Error::SystemError(error))
+                Some(system_error(error))
             })
         }
     }
@@ -453,7 +432,7 @@ impl Vsock {
     #[cfg(feature="random_port")]
     fn gen_rand_port() -> Result<u32, Error> {
         let mut buf = [0u8; 4];
-        getrandom::getrandom(&mut buf).map_err(|_e| Error::EntropyError)?;
+        getrandom::getrandom(&mut buf).map_err(|_e| entropy_error())?;
         let port = u32::from_le_bytes(buf);
         if port <= MAX_PRIVILEGED_PORT {
             Self::gen_rand_port()
@@ -511,7 +490,7 @@ impl Vsock {
         }
         #[cfg(not(feature="random_port"))]
         if port == 0 {
-            return Err(Error::ReservedPort);
+            return Err(reserved_port());
         }
         bind_ex::<P>(self, cid, port, BIND_RETRIES)
     }
@@ -724,7 +703,7 @@ impl<P: Platform> VsockStream<P> {
             Ok(if error == 0 {
                 None
             } else {
-                Some(Error::SystemError(error))
+                Some(system_error(error))
             })
         }
     }
@@ -743,7 +722,7 @@ impl<P: Platform> VsockStream<P> {
         match dur {
             Some(dur) => {
                 if dur.as_secs() == 0 && dur.subsec_nanos() == 0 {
-                    return Err(Error::ZeroDurationTimeout);
+                    return Err(zero_duration_timeout());
                 }
 
                 // https://github.com/rust-lang/libc/issues/1848
@@ -755,7 +734,7 @@ impl<P: Platform> VsockStream<P> {
                 };
                 let mut timeout = timeval {
                     tv_sec: secs,
-                    tv_usec: i64::from(dur.subsec_micros()) as suseconds_t,
+                    tv_usec: i64::from(dur.subsec_micros()),
                 };
                 if timeout.tv_sec == 0 && timeout.tv_usec == 0 {
                     timeout.tv_usec = 1;
@@ -821,25 +800,25 @@ impl<P: Platform> VsockStream<P> {
 
 #[cfg(feature="std")]
 impl Read for VsockStream<Std> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         <&Self>::read(&mut &*self, buf).into()
     }
 }
 
 #[cfg(feature="std")]
 impl Write for VsockStream<Std> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
         <&Self>::write(&mut &*self, buf).into()
     }
 
-    fn flush(&mut self) -> Result<(), io::Error> {
+    fn flush(&mut self) -> Result<(), Error> {
         Ok(())
     }
 }
 
 #[cfg(feature="std")]
 impl Read for &VsockStream<Std> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         VsockStream::<Std>::read(self, buf)
             .map_err(|e| e.into())
     }
@@ -847,12 +826,12 @@ impl Read for &VsockStream<Std> {
 
 #[cfg(feature="std")]
 impl Write for &VsockStream<Std> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
         VsockStream::<Std>::write(self, buf)
             .map_err(|e| e.into())
     }
 
-    fn flush(&mut self) -> Result<(), io::Error> {
+    fn flush(&mut self) -> Result<(), Error> {
         VsockStream::<Std>::flush()
             .map_err(|e| e.into())
     }
@@ -900,7 +879,7 @@ ioctl_read_bad!(
 /// Note that when calling [`VsockListener::bind`], you should generally use [`VMADDR_CID_ANY`]
 /// instead, and for making a loopback connection you should use [`VMADDR_CID_LOCAL`].
 #[cfg(feature="std")]
-pub fn get_local_cid() -> Result<u32, io::Error> {
+pub fn get_local_cid() -> Result<u32, Error> {
     let f = File::open("/dev/vsock")?;
     let mut cid = 0;
     // SAFETY: the kernel only modifies the given u32 integer.
@@ -909,7 +888,7 @@ pub fn get_local_cid() -> Result<u32, io::Error> {
 }
 
 #[test]
-#[cfg(all(features="std", feature="random_port"))]
+#[cfg(all(feature="std", feature="random_port"))]
 fn rand_ports() {
     let mut ports = Vec::new();
     for _i in 0..1000 {
