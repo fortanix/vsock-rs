@@ -324,7 +324,7 @@ impl<P: Platform> VsockListener<P> {
     }
 
     /// An iterator over the connections being received on this listener.
-    pub fn incoming(&self) -> Incoming<P> {
+    pub fn incoming(&self) -> Incoming<'_, P> {
         Incoming::<P> { listener: self }
     }
 
@@ -739,6 +739,8 @@ impl<P: Platform> VsockStream<P> {
         }
     }
 
+    // https://github.com/rust-lang/libc/issues/1848
+    #[cfg_attr(target_env = "musl", allow(deprecated))]
     fn timeval_from_duration(dur: Option<Duration>) -> Result<timeval, Error> {
         match dur {
             Some(dur) => {
@@ -746,10 +748,8 @@ impl<P: Platform> VsockStream<P> {
                     return Err(Error::ZeroDurationTimeout);
                 }
 
-                // https://github.com/rust-lang/libc/issues/1848
-                #[cfg_attr(target_env = "musl", allow(deprecated))]
-                let secs = if dur.as_secs() > time_t::max_value() as u64 {
-                    time_t::max_value()
+                let secs = if dur.as_secs() > time_t::MAX as u64 {
+                    time_t::MAX
                 } else {
                     dur.as_secs() as time_t
                 };
@@ -909,7 +909,7 @@ pub fn get_local_cid() -> Result<u32, io::Error> {
 }
 
 #[test]
-#[cfg(all(features="std", feature="random_port"))]
+#[cfg(all(feature="std", feature="random_port"))]
 fn rand_ports() {
     let mut ports = Vec::new();
     for _i in 0..1000 {
