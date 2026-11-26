@@ -4,14 +4,13 @@ version = "0.2.4"
 authors = ["fsyncd", "rust-vsock"]
 description = "Virtio socket support for Rust"
 repository = "https://github.com/rust-vsock/vsock-rs"
-homepage = "https://github.com/rust-vsock/vsock-rs"
 readme = "README.md"
 license = "Apache-2.0"
 edition = "2018"
 exclude = ["test_fixture"]
 
 [dependencies]
-compiler_builtins = { version = '0.1.2', optional = true }
+compiler_builtins = { version = '0.1.67', optional = true }
 core = { version = '1.0.0', optional = true, package = 'rustc-std-workspace-core' }
 libc = "0.2.147"
 nix = { version = "0.22.1", optional = true }

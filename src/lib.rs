@@ -66,6 +66,8 @@ pub enum Error {
     WrongAddressType,
     ZeroDurationTimeout,
     ReservedPort,
+    WriteZero,
+    UnexpectedEof,
 }
 
 impl Display for Error {
@@ -76,6 +78,8 @@ impl Display for Error {
             Error::WrongAddressType    => write!(f, "wrong address type provided"),
             Error::ZeroDurationTimeout => write!(f, "cannot set a zero duration timeout"),
             Error::ReservedPort        => write!(f, "reserved port"),
+            Error::WriteZero           => write!(f, "zero bytes written"),
+            Error::UnexpectedEof       => write!(f, "unexpected EOF"),
         }
     }
 }
@@ -92,6 +96,8 @@ impl From<Error> for io::Error {
             Error::SystemError(errno)  => io::Error::from_raw_os_error(errno),
             Error::WrongAddressType    => io::Error::new(ErrorKind::InvalidInput, err),
             Error::ZeroDurationTimeout => io::Error::new(ErrorKind::InvalidInput, err),
+            Error::WriteZero           => io::Error::new(ErrorKind::WriteZero, err),
+            Error::UnexpectedEof       => io::Error::new(ErrorKind::UnexpectedEof, err),
         }
     }
 }
@@ -324,7 +330,7 @@ impl<P: Platform> VsockListener<P> {
     }
 
     /// An iterator over the connections being received on this listener.
-    pub fn incoming(&self) -> Incoming<P> {
+    pub fn incoming(&self) -> Incoming<'_, P> {
         Incoming::<P> { listener: self }
     }
 
@@ -739,6 +745,8 @@ impl<P: Platform> VsockStream<P> {
         }
     }
 
+    // https://github.com/rust-lang/libc/issues/1848
+    #[cfg_attr(target_env = "musl", allow(deprecated))]
     fn timeval_from_duration(dur: Option<Duration>) -> Result<timeval, Error> {
         match dur {
             Some(dur) => {
@@ -746,10 +754,8 @@ impl<P: Platform> VsockStream<P> {
                     return Err(Error::ZeroDurationTimeout);
                 }
 
-                // https://github.com/rust-lang/libc/issues/1848
-                #[cfg_attr(target_env = "musl", allow(deprecated))]
-                let secs = if dur.as_secs() > time_t::max_value() as u64 {
-                    time_t::max_value()
+                let secs = if dur.as_secs() > time_t::MAX as u64 {
+                    time_t::MAX
                 } else {
                     dur.as_secs() as time_t
                 };
@@ -794,24 +800,36 @@ impl<P: Platform> VsockStream<P> {
         }
     }
 
-    #[cfg(not(feature="std"))]
-    pub fn write_all(&self, buf: &[u8]) -> Result<usize, Error> {
-        if buf.len() == 0 {
-            return Ok(0);
+    pub fn write_all(&self, mut buf: &[u8]) -> Result<usize, Error> {
+        while !buf.is_empty() {
+            match self.write(buf) {
+                Ok(0) => return Err(Error::WriteZero),
+                Ok(n) => buf = &buf[n..],
+                // retry on EINTR
+                Err(Error::SystemError(e)) if e == libc::EINTR => continue,
+                Err(e) => return Err(e),
+            }
         }
 
-        let n = self.write(buf)?;
-        Ok(n + self.write_all(&buf[n..])?)
+        Ok(buf.len())
     }
 
-    #[cfg(not(feature="std"))]
+    // keeping `read_all` for backwards compatibility.
     pub fn read_all(&self, buf: &mut [u8]) -> Result<usize, Error> {
-        if buf.len() == 0 {
-            return Ok(0);
-        }
+        self.read_exact(buf).and(Ok(buf.len()))
+    }
 
-        let n = self.read(buf)?;
-        Ok(n + self.read_all(&mut buf[n..])?)
+    pub fn read_exact(&self, mut buf: &mut [u8]) -> Result<(), Error> {
+        while !buf.is_empty() {
+            match self.read(buf) {
+                Ok(0) => return Err(Error::UnexpectedEof),
+                Ok(n) => buf = &mut core::mem::take(&mut buf)[n..],
+                // retry on EINTR
+                Err(Error::SystemError(e)) if e == libc::EINTR => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     pub fn flush() -> Result<(), Error> {
@@ -909,7 +927,7 @@ pub fn get_local_cid() -> Result<u32, io::Error> {
 }
 
 #[test]
-#[cfg(all(features="std", feature="random_port"))]
+#[cfg(all(feature="std", feature="random_port"))]
 fn rand_ports() {
     let mut ports = Vec::new();
     for _i in 0..1000 {
